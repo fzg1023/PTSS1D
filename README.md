@@ -1,0 +1,490 @@
+# Prediction Target Selection in Supervised 1D Signal Denoising
+
+**A unified framework for comparing clean-signal prediction and noise-residual prediction across five one-dimensional denoising architectures.**
+
+[English](#english) | [中文](#chinese)
+
+<a id="english"></a>
+## English
+
+### Overview
+
+This repository studies the choice of prediction target in supervised one-dimensional signal denoising:
+
+- **x-pred:** directly predict the clean signal.
+- **n-pred:** predict the additive noise residual and subtract it from the noisy observation.
+
+The framework supports **1D ViT, 1D U-Net, 1D-DnCNN, L-WPT, and TEM1Dformer**, with Gaussian white noise and pink noise. It provides configurable training, evaluation, inference, multi-seed experiments, and result aggregation for audio, seismic, ECG, and vibration signals.
+
+**Datasets and pretrained weights are not included.** Model checkpoints are generated locally during training.
+
+### Repository structure
+
+```text
+.
+├── configs/                  Dataset-specific experiment configurations
+├── data/README.md            Data preparation instructions
+├── models/                   Five denoising architectures
+│   └── config.py             Model defaults and ViT capacity configurations
+├── tests/smoke.py            End-to-end test using synthetic data
+├── data_pipeline.py          Data loading, corruption, and normalization
+├── metrics.py                SNR improvement, RMSE, and FPCC
+├── run.py                    Training and evaluation
+├── batch.py                  Batch experiment launcher
+├── infer.py                  Inference on noisy observations
+├── summarize.py              Multi-seed statistics and C(s)
+├── requirements.txt          Dependencies
+└── THIRD_PARTY_NOTICES.md    Attribution and licensing information
+```
+
+### Installation
+
+Requirements: **Python 3.9+**, **PyTorch 2.0+**, and **NumPy 1.24+**.
+
+Install a PyTorch build suitable for your CPU or CUDA environment, then install the remaining dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run the following commands from the repository root—the directory containing `run.py`. The default device is CUDA when available, otherwise CPU. Use `--device cpu` or `--device cuda:0` to select a device explicitly.
+
+### Data preparation
+
+Provide clean training and test signals as numeric NumPy arrays with shape **`[N,L]`** or **`[N,1,L]`**, where N is the number of samples and L is the signal length. Object arrays, pickled data, and implicit multichannel selection are not supported.
+
+```text
+data/
+├── audio/
+│   ├── train.npy
+│   └── test.npy
+├── seismic/
+│   ├── train.npy
+│   └── test.npy
+├── ecg/
+│   ├── train.npy
+│   └── test.npy
+└── vibration/
+    ├── train.npy
+    └── test.npy
+```
+
+| Signal domain | Dataset | Configuration | Input length |
+| --- | --- | --- | --- |
+| Heart sounds / audio | ZCHSound | configs/audio.json | 16384 |
+| Seismic | STEAD | configs/seismic.json | 6144 |
+| ECG | CPSC2018 | configs/ecg.json | 4096 |
+| Mechanical vibration | BJTU gearbox | configs/vibration.json | 1024 |
+
+Update `train_path` and `test_path` in the configuration file or pass `--train-path` and `--test-path`. Relative paths are resolved from the current working directory.
+
+Prepare independent training and test sets before running the code. Separate related recordings, patients, events, or equipment sources as appropriate to avoid data leakage. Dataset downloading, resampling, and conversion from the original databases are not provided.
+
+By default, 10% of the training array is reserved for validation using a fixed split seed of 2026. Longer signals are randomly cropped during training and cropped from the beginning during validation and testing. Shorter signals are zero-padded on the right.
+
+### Models and configurations
+
+Model defaults are defined in [models/config.py](models/config.py).
+
+| Model | Default configuration |
+| --- | --- |
+| 1D ViT | 4 Transformer blocks; 8 attention heads; convolutional patch embedding; RoPE; RMSNorm; SwiGLU |
+| 1D U-Net | 4 downsampling/upsampling stages; base channels 32; kernel size 3; two convolutions per block; GroupNorm; GELU |
+| 1D-DnCNN | 18 convolutional layers; 32 feature channels; ReLU and intermediate BatchNorm |
+| L-WPT | 5 decomposition levels; 32 terminal subbands; 8-tap db4-initialized filters; learnable smooth thresholds; 1,054 parameters |
+| TEM1Dformer | Feature dimension 32; one Transformer encoder with 4 heads and FFN dimension 64; at most 256 attention tokens; 10 local residual blocks; 77,441 parameters |
+
+The TEM1Dformer implementation uses adaptive average pooling to limit the attention sequence to 256 tokens, followed by linear interpolation to the input length before local residual processing. This is a long-sequence adaptation. L-WPT does not use patch embedding; TEM1Dformer's `max_tokens` is distinct from ViT's `patch_size`.
+
+#### ViT capacity experiments
+
+| Configuration | Patch size: Audio / Seismic / ECG / Vibration | Hidden dimension | Tokens |
+| --- | --- | --- | --- |
+| #1 | 128 / 48 / 32 / 8 | 128 | 128 |
+| #2 | 256 / 96 / 64 / 16 | 128 | 64 |
+| #3 | 512 / 192 / 128 / 32 | 128 | 32 |
+| #4 | 512 / 192 / 128 / 32 | 512 | 32 |
+| #5 | 512 / 192 / 128 / 32 | 256 | 32 |
+
+Configuration #3 is the default. Configurations #1–#3 vary token count at a fixed hidden dimension; #4, #5, and #3 vary hidden dimension at a fixed token count.
+
+Use `--vit-configuration` to select a configuration. Other native model parameters can be supplied as a JSON object through `--model-options`, or edited in `models/config.py`. Keep architecture settings identical between paired x-pred and n-pred experiments.
+
+### Noise and prediction targets
+
+**White noise:** standard Gaussian samples are scaled according to clean-signal power and the selected SNR. Individual white-noise realizations are not separately centered or standardized. All five models use this procedure.
+
+**Pink noise:** white noise is transformed using rFFT, weighted by `1/sqrt(f)`, and transformed back. The resulting sequence is centered and standardized before SNR-based scaling.
+
+During training, the noise amplitude ratio is sampled uniformly between `10^(-50/20)` and `10^(15/20)`, corresponding to nominal SNRs from −15 to 50 dB. SNR is **not** sampled uniformly in dB.
+
+Clean and noisy signals are normalized using the noisy observation's statistics:
+
+```text
+x = (x_raw - mean(y_raw)) / (std(y_raw) + 1e-8)
+y = (y_raw - mean(y_raw)) / (std(y_raw) + 1e-8)
+n = y - x
+
+x-pred: target = x; clean estimate = model(y)
+n-pred: target = n; clean estimate = y - model(y)
+```
+
+Thus, the n-target is the normalized noise residual, not the noisy observation. The selected noise type is used in both training and evaluation.
+
+### Training and evaluation
+
+Default settings: **AdamW**, learning rate **2e-4**, batch size **256**, **100 epochs**, MSE loss, weight decay **1e-4**, cosine learning-rate scheduling, and gradient clipping at **1.0**. The checkpoint with the lowest validation reconstruction MSE is retained.
+
+Train and evaluate TEM1Dformer with white noise and x-pred:
+
+```bash
+python run.py run --config configs/vibration.json --model TEM1Dformer --noise white --target x-pred --seed 42 --run-dir outputs/vibration/tem_white_x_42
+```
+
+Train and evaluate L-WPT with pink noise and n-pred:
+
+```bash
+python run.py run --config configs/vibration.json --model L-WPT --noise pink --target n-pred --seed 42 --run-dir outputs/vibration/lwpt_pink_n_42
+```
+
+Train ViT configuration #1 on audio, then evaluate the saved checkpoint separately:
+
+```bash
+python run.py train --config configs/audio.json --model 1D-ViT --vit-configuration 1 --run-dir outputs/audio/vit_c1_x
+python run.py test --run-dir outputs/audio/vit_c1_x
+```
+
+Use `--epochs` or `--batch-size` to override training settings. If GPU memory is insufficient, explicitly reduce batch size and document the change. The code does not automatically change the model or input length.
+
+Training refuses to overwrite a nonempty run directory. Automatic training resumption is not implemented. Testing regenerates the run's `metrics.csv`.
+
+| Output | Description |
+| --- | --- |
+| config.json | Actual run configuration |
+| split.json | Training/validation sample indices |
+| history.csv | Training and validation losses |
+| best.pt | Best locally trained checkpoint |
+| metrics.csv | Evaluation results at each test SNR |
+
+### Batch experiments
+
+Preview the default experiment commands:
+
+```bash
+python batch.py
+```
+
+Execute the default sweep:
+
+```bash
+python batch.py --execute
+```
+
+The default sweep contains **400 runs**: five models × four datasets × two noise types × two prediction targets × five seeds. The seeds are `42,43,44,45,46`. Without `--execute`, no training is performed.
+
+Run all five ViT capacity configurations:
+
+```bash
+python batch.py --models 1D-ViT --vit-configurations 1 2 3 4 5 --execute
+```
+
+Run a smaller subset:
+
+```bash
+python batch.py --datasets vibration --models L-WPT TEM1Dformer --seeds 42 --execute
+```
+
+Each experiment uses a separate directory. A failed command stops the batch.
+
+### Inference
+
+Denoise an existing noisy array using a locally trained checkpoint:
+
+```bash
+python infer.py --run-dir outputs/vibration/tem_white_x_42 --input noisy.npy --output denoised.npy
+```
+
+Inference does not add synthetic noise. Inputs must have shape `[N,L]` or `[N,1,L]` and match the training signal length. Outputs have shape `[N,L]` and are restored to the original amplitude scale. Automatic sliding-window inference is not provided.
+
+### Metrics and aggregation
+
+The default nominal test SNRs are **−12, −8, −4, 0, 4, 8, and 12 dB**. Metrics are computed per signal and then averaged:
+
+- **SNR improvement:** actual output SNR minus actual input SNR.
+- **RMSE:** root mean square error in the shared normalized signal space.
+- **FPCC:** Pearson correlation between linear amplitude spectra `abs(rfft(signal))`, including DC and Nyquist where applicable; no logarithm or additional window is used.
+
+The realized white-noise SNR may differ slightly from the nominal value. FPCC is undefined for constant amplitude spectra; these cases are recorded as NaN with valid-sample counts.
+
+Aggregate completed experiments:
+
+```bash
+python summarize.py --root outputs --output summary
+```
+
+Use an empty output directory. The script produces `all_metrics.csv` and `seed_summary.csv`. Complete white/pink × x-pred/n-pred sets additionally produce `C_s_per_seed.csv` and `C_s_summary.csv`.
+
+```text
+C(s) = [P_x_white(s) - P_n_white(s)] - [P_x_pink(s) - P_n_pink(s)]
+```
+
+P denotes SNR improvement. Positive C(s) indicates a relative shift toward n-pred when white noise is replaced by pink noise; it does not necessarily indicate higher absolute denoising performance.
+
+C(s) is calculated within each seed before aggregation. Fields ending in `_sample_std` describe variability across test samples, whereas `_seed_std` describes variability across independent seed-level means. Standard deviations use `ddof=1`. Single-seed standard deviations are NaN, not zero. Incomplete paired sets are reported and skipped; duplicates raise an error.
+
+### Reproducibility and testing
+
+Training noise is determined by seed, sample index, and epoch. Validation and test noise are fixed. Paired runs with identical data and preprocessing settings use matching corruption for the same seed. Cross-platform or cross-version bitwise reproducibility is not guaranteed.
+
+Run the end-to-end smoke test:
+
+```bash
+python -B tests/smoke.py
+```
+
+The test uses temporary synthetic signals to check training, checkpoint loading, evaluation, inference, ViT capacity configurations, and aggregation. Passing a smoke test does not establish full real-data reproduction.
+
+### Attribution and licensing
+
+See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for implementation provenance and third-party considerations. Datasets remain subject to their providers' terms. A project license has not yet been assigned; source availability alone does not grant unrestricted reuse or redistribution rights.
+
+---
+
+<a id="chinese"></a>
+## 中文
+
+### 项目简介
+
+本项目提供一维监督信号去噪的统一实验框架，用于比较两种预测目标：
+
+- **x-pred：**直接预测纯净信号。
+- **n-pred：**预测加性噪声残差，再从含噪观测中减去预测噪声。
+
+框架包含 **1D ViT、1D U-Net、1D-DnCNN、L-WPT 和 TEM1Dformer**，支持高斯白噪声和粉色噪声，提供训练、测试、推理、多随机种子实验及结果汇总功能，覆盖音频、地震、心电和机械振动四类信号。
+
+**本仓库不包含数据集和预训练权重。** 模型权重由使用者在本地训练生成。
+
+### 目录结构
+
+```text
+configs/                  四个数据集的实验配置
+data/README.md            数据准备说明
+models/                   五类去噪网络
+models/config.py          模型默认参数及 ViT 容量配置
+tests/smoke.py            合成数据端到端测试
+data_pipeline.py          数据读取、加噪与归一化
+metrics.py                SNR improvement、RMSE 和 FPCC
+run.py                    训练与测试入口
+batch.py                  批量实验入口
+infer.py                  含噪信号推理
+summarize.py              多种子统计及 C(s) 汇总
+requirements.txt          环境依赖
+THIRD_PARTY_NOTICES.md    代码来源与许可说明
+```
+
+### 安装
+
+环境要求：**Python 3.9+、PyTorch 2.0+、NumPy 1.24+**。
+
+先安装适合本机 CPU 或 CUDA 环境的 PyTorch，再安装依赖：
+
+```bash
+pip install -r requirements.txt
+```
+
+以下命令均在包含 `run.py` 的项目根目录运行。默认优先使用 CUDA，不可用时使用 CPU；可通过 `--device cpu` 或 `--device cuda:0` 指定设备。
+
+### 数据准备
+
+将已划分的纯净训练集和测试集保存为数值型 NumPy 数组，形状为 **`[N,L]`** 或 **`[N,1,L]`**。N 为样本数，L 为序列长度。不支持 object 数组、pickle 数据或自动选择多通道。
+
+```text
+data/
+├── audio/train.npy
+├── audio/test.npy
+├── seismic/train.npy
+├── seismic/test.npy
+├── ecg/train.npy
+├── ecg/test.npy
+├── vibration/train.npy
+└── vibration/test.npy
+```
+
+| 信号类型 | 数据集 | 配置文件 | 输入长度 |
+| --- | --- | --- | --- |
+| 心音 / 音频 | ZCHSound | configs/audio.json | 16384 |
+| 地震 | STEAD | configs/seismic.json | 6144 |
+| 心电 | CPSC2018 | configs/ecg.json | 4096 |
+| 机械振动 | BJTU gearbox | configs/vibration.json | 1024 |
+
+可在配置文件中修改 `train_path`、`test_path`，也可通过 `--train-path`、`--test-path` 指定路径。相对路径以当前工作目录为基准。
+
+请提前划分独立训练集和测试集，并按患者、事件、录音或设备等来源进行必要隔离，避免相关片段跨集合导致数据泄漏。本项目不提供原始数据库下载、重采样及格式转换流程。
+
+默认从训练数组中固定划分 10% 作为验证集，划分种子为 2026。长序列在训练时随机裁剪，在验证和测试时截取首段；短序列在右侧补零。
+
+### 模型配置
+
+模型参数集中在 [models/config.py](models/config.py)。
+
+| 模型 | 默认配置 |
+| --- | --- |
+| 1D ViT | 4 个 Transformer blocks，8 个注意力头，卷积 patch 嵌入，RoPE，RMSNorm，SwiGLU |
+| 1D U-Net | 4 级下采样/上采样，基础通道数 32，卷积核 3，每块 2 个卷积，GroupNorm，GELU |
+| 1D-DnCNN | 18 个卷积层，32 个特征通道，ReLU，中间层 BatchNorm |
+| L-WPT | 5 层分解，32 个末端子带，8 点 db4 初始化滤波器，可学习平滑阈值，1,054 个参数 |
+| TEM1Dformer | 特征维度 32，1 个 Transformer 编码器，4 个注意力头，FFN 维度 64，最多 256 个注意力 token，10 个局部残差块，77,441 个参数 |
+
+TEM1Dformer 使用适配长序列的池化机制：自适应平均池化将注意力序列限制为最多 256 个 token，随后通过线性插值恢复至输入长度，再进行局部残差处理。L-WPT 不使用 patch 嵌入；TEM1Dformer 的 `max_tokens` 不等同于 ViT 的 `patch_size`。
+
+#### ViT 容量实验
+
+| 配置 | Patch：音频 / 地震 / 心电 / 振动 | Hidden dimension | Token 数 |
+| --- | --- | --- | --- |
+| #1 | 128 / 48 / 32 / 8 | 128 | 128 |
+| #2 | 256 / 96 / 64 / 16 | 128 | 64 |
+| #3 | 512 / 192 / 128 / 32 | 128 | 32 |
+| #4 | 512 / 192 / 128 / 32 | 512 | 32 |
+| #5 | 512 / 192 / 128 / 32 | 256 | 32 |
+
+默认使用 #3。配置 #1–#3 固定隐藏维度、改变 token 数；配置 #4、#5、#3 固定 token 数、改变隐藏维度。
+
+通过 `--vit-configuration` 选择配置。其他模型参数可通过 `--model-options` 传入 JSON 对象，或直接修改 `models/config.py`。比较 x-pred 与 n-pred 时应保持网络配置一致。
+
+### 加噪和预测目标
+
+**高斯白噪声：**直接采样标准高斯噪声，再根据纯净信号功率及指定 SNR 缩放。不对每条白噪声额外去均值或标准化，五个模型均采用这一方式。
+
+**粉色噪声：**对白噪声进行 rFFT，施加 `1/sqrt(f)` 幅度权重后逆变换，再去均值、标准化，最后按 SNR 缩放。
+
+训练噪声幅度比在 `10^(-50/20)` 至 `10^(15/20)` 之间均匀采样，对应名义 SNR 范围 −15 至 50 dB；**不是在 dB 空间均匀采样**。
+
+纯净信号和含噪信号共同使用含噪观测的统计量归一化：
+
+```text
+x = (x_raw - mean(y_raw)) / (std(y_raw) + 1e-8)
+y = (y_raw - mean(y_raw)) / (std(y_raw) + 1e-8)
+n = y - x
+
+x-pred：训练目标为 x，重构结果为 model(y)
+n-pred：训练目标为 n，重构结果为 y - model(y)
+```
+
+因此 n-target 是归一化坐标下的纯噪声残差，不是含噪信号。训练与测试使用所选的同一种噪声类型。
+
+### 训练和测试
+
+默认配置：**AdamW、学习率 2e-4、batch size 256、100 轮**，使用 MSE 损失、weight decay 1e-4、余弦学习率调度及 1.0 梯度裁剪。按验证集重构 MSE 保存最佳权重。
+
+训练并测试白噪声条件下的 TEM1Dformer x-pred：
+
+```bash
+python run.py run --config configs/vibration.json --model TEM1Dformer --noise white --target x-pred --seed 42 --run-dir outputs/vibration/tem_white_x_42
+```
+
+训练并测试粉色噪声条件下的 L-WPT n-pred：
+
+```bash
+python run.py run --config configs/vibration.json --model L-WPT --noise pink --target n-pred --seed 42 --run-dir outputs/vibration/lwpt_pink_n_42
+```
+
+训练音频 ViT 配置 #1，然后独立测试：
+
+```bash
+python run.py train --config configs/audio.json --model 1D-ViT --vit-configuration 1 --run-dir outputs/audio/vit_c1_x
+python run.py test --run-dir outputs/audio/vit_c1_x
+```
+
+可用 `--epochs` 和 `--batch-size` 覆盖训练设置。显存不足时请显式减小 batch size，并记录变更；程序不会自动调整网络或输入长度。
+
+训练不会覆盖非空输出目录，也不自动续训。测试会重新生成该实验目录中的 `metrics.csv`。
+
+| 输出文件 | 内容 |
+| --- | --- |
+| config.json | 实际运行配置 |
+| split.json | 训练/验证样本索引 |
+| history.csv | 每轮训练和验证损失 |
+| best.pt | 本地训练得到的最佳权重 |
+| metrics.csv | 各测试 SNR 下的指标 |
+
+### 批量实验
+
+预览默认实验命令：
+
+```bash
+python batch.py
+```
+
+执行默认实验：
+
+```bash
+python batch.py --execute
+```
+
+默认共 **400 次训练**：5 个模型 × 4 个数据集 × 2 种噪声 × 2 种目标 × 5 个随机种子。种子为 `42,43,44,45,46`。不加 `--execute` 时仅预览，不训练。
+
+运行全部五种 ViT 容量配置：
+
+```bash
+python batch.py --models 1D-ViT --vit-configurations 1 2 3 4 5 --execute
+```
+
+只运行部分实验：
+
+```bash
+python batch.py --datasets vibration --models L-WPT TEM1Dformer --seeds 42 --execute
+```
+
+每次实验使用独立目录；某次运行失败后批处理停止。
+
+### 推理
+
+使用本地训练权重处理已有含噪信号：
+
+```bash
+python infer.py --run-dir outputs/vibration/tem_white_x_42 --input noisy.npy --output denoised.npy
+```
+
+推理不会额外人工加噪。输入形状为 `[N,L]` 或 `[N,1,L]`，长度须与训练设置一致。输出为 `[N,L]`，并恢复至原始幅度尺度。不提供任意长度信号的自动滑窗拼接。
+
+### 指标和结果汇总
+
+默认测试名义 SNR 为 **−12、−8、−4、0、4、8、12 dB**。逐样本计算指标后再求平均：
+
+- **SNR improvement：**实际输出 SNR 减去实际输入 SNR。
+- **RMSE：**共同归一化空间内的均方根误差。
+- **FPCC：**线性幅度谱 `abs(rfft(signal))` 的 Pearson 相关系数，包含 DC 和适用时的 Nyquist 分量，不取对数、不额外加窗。
+
+有限样本的实际白噪声 SNR 可能与名义值略有不同。常量幅度谱的 FPCC 未定义，记为 NaN 并记录有效样本数。
+
+汇总已完成实验：
+
+```bash
+python summarize.py --root outputs --output summary
+```
+
+输出目录须为空。生成 `all_metrics.csv` 和 `seed_summary.csv`；具有完整白/粉噪声与 x/n 目标配对时，还生成 `C_s_per_seed.csv` 和 `C_s_summary.csv`。
+
+```text
+C(s) = [P_x_white(s) - P_n_white(s)] - [P_x_pink(s) - P_n_pink(s)]
+```
+
+其中 P 表示 SNR improvement。C(s)>0 表示由白噪声换为粉色噪声后，相对性能向有利于 n-pred 的方向变化，不代表绝对去噪性能一定提高。
+
+先在同一随机种子内计算 C(s)，再跨种子统计。`_sample_std` 表示测试样本间标准差，`_seed_std` 表示独立种子均值间标准差，均使用 `ddof=1`。单种子标准差记为 NaN，不补零；缺失配对会报告并跳过，重复实验会报错。
+
+### 可复现性和自检
+
+训练噪声由种子、样本索引和 epoch 决定；验证与测试噪声固定。相同数据及预处理配置下，同一种子的目标配对实验使用一致的加噪样本。不保证不同硬件或软件版本间的位级一致性。
+
+运行端到端自检：
+
+```bash
+python -B tests/smoke.py
+```
+
+自检使用临时合成数据，检查训练、权重加载、测试、推理、ViT 容量配置及汇总。通过自检不等同于完成真实数据实验复现。
+
+### 来源和许可
+
+实现来源及第三方相关事项见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。数据集使用须遵守各提供方的许可。本项目尚未指定代码许可证；源码可见不等于授予不受限制的使用或再分发权利。

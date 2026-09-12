@@ -1,0 +1,28 @@
+{
+  "dataset": "Seismic",
+  "model": "1D-ViT",
+  "target": "x-pred",
+  "noise": "white",
+  "seed": 42,
+  "signal_length": 6144,
+  "train_path": "data/seismic/train.npy",
+  "test_path": "data/seismic/test.npy",
+  "epochs": 100,
+  "batch_size": 256,
+  "learning_rate": 0.0002,
+  "weight_decay": 0.0001,
+  "grad_clip": 1,
+  "validation_fraction": 0.1,
+  "split_seed": 2026,
+  "min_snr": -15,
+  "max_snr": 50,
+  "test_snrs": [
+    -12,
+    -8,
+    -4,
+    0,
+    4,
+    8,
+    12
+  ]
+}
