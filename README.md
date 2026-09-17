@@ -1,4 +1,4 @@
-# Prediction Target Selection in Supervised 1D Signal Denoising
+# Structure–Capacity Matching in Neural Network Learning: Prediction Target Selection for 1D Signal Denoising
 
 **A unified framework for comparing clean-signal prediction and noise-residual prediction across five one-dimensional denoising architectures.**
 
