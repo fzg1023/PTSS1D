@@ -1,0 +1,43 @@
+{
+  "release_date": "2026-10-29",
+  "entry_point": "run_toy.py",
+  "historical_implementation_preserved": [
+    "src/run_experiment.py",
+    "src/highdim_experiment.py"
+  ],
+  "changes": "Portable launcher, declarative grids, documentation and dependency specification; no edits to original training or data generator.",
+  "files": {
+    "run_toy.py": {
+      "bytes": 7579,
+      "sha256": "e1b7baecee7cb152fa2fa6fda86d4c5f8eb2a5e9dc1ed56e8c1937eaa923c0a8"
+    },
+    "configs.json": {
+      "bytes": 1047,
+      "sha256": "203aec260014079b21836f36f6e78bf02e6112400fc5509ec7c682c5e86cf5f6"
+    },
+    "requirements.txt": {
+      "bytes": 186,
+      "sha256": "80549a8501b498179ce5950589faeca8f5446b461197facf512f763e17bd5fcb"
+    },
+    ".gitignore": {
+      "bytes": 63,
+      "sha256": "f4035dd616e5ab608cba6c0486c22c9c7bdb6f4500220725a820052ea8453041"
+    },
+    "README.md": {
+      "bytes": 9966,
+      "sha256": "976d87a39820edcbe327c889178de22931bb0a990fd4771c317d96f3c506f96a"
+    },
+    "VALIDATION.md": {
+      "bytes": 1920,
+      "sha256": "735ff8f56e771cf0e8ea89b051eed6ab3c40ab60e73d793674daa5f66180c080"
+    },
+    "src/run_experiment.py": {
+      "bytes": 20433,
+      "sha256": "f3c3b0a0c1df970e1c8fb5cd05158f4f5fce37b7bc379b286d266d8095c4861f"
+    },
+    "src/highdim_experiment.py": {
+      "bytes": 3687,
+      "sha256": "7165810b0c60be4997a8c694f53e854c3a28fcf11648a83cc3d554e01c8d8749"
+    }
+  }
+}

@@ -1,0 +1,5 @@
+# Reference training environment: Python 3.9, torch 2.5.1+cu118, numpy 2.0.2.
+# Install the appropriate CPU/CUDA build of torch for your machine.
+torch==2.5.1
+numpy==2.0.2
+scipy>=1.9,<2
